@@ -1,257 +1,129 @@
-import { DecorationOptions, Disposable, window } from "vscode";
+import { WaitGroup } from "@jpwilliams/waitgroup";
+import { Disposable } from "vscode";
 
-import { HighlightConfiguration, HighlightProvider } from "./highlight_provider";
+import { EventBusData, VimHighlightUIAttributes, eventBus } from "./eventBus";
+import { HighlightGrid } from "./highlights/highlight_grid";
+import { HighlightGroupStore } from "./highlights/highlight_group_store";
+import { VimCell } from "./highlights/types";
 import { MainController } from "./main_controller";
-import { NeovimExtensionRequestProcessable, NeovimRedrawProcessable } from "./neovim_events_processable";
-import { calculateEditorColFromVimScreenCol, convertByteNumToCharNum, GridLineEvent } from "./utils";
+import { disposeAll } from "./utils";
 
-export interface HighlightManagerSettings {
-    highlight: HighlightConfiguration;
-}
+// We have fixed statuscolumn width
+const STATUSCOLUMN_WIDTH = 20;
 
-// const LOG_PREFIX = "HighlightManager";
-
-export class HighlightManager implements Disposable, NeovimRedrawProcessable, NeovimExtensionRequestProcessable {
+export class HighlightManager implements Disposable {
     private disposables: Disposable[] = [];
+    private redrawWaitGroup = new WaitGroup();
+    // Manages the highlight groups
+    private groupStore: HighlightGroupStore;
+    // Map of gridId -> HighlightGrid
+    private highlightGrids: Map<number, HighlightGrid> = new Map();
 
-    private highlightProvider: HighlightProvider;
-
-    private commandsDisposables: Disposable[] = [];
-
-    public constructor(private main: MainController, private settings: HighlightManagerSettings) {
-        this.highlightProvider = new HighlightProvider(settings.highlight);
-
-        // this.commandsDisposables.push(
-        //     commands.registerCommand("editor.action.indentationToTabs", () =>
-        //         this.resetHighlight("editor.action.indentationToTabs"),
-        //     ),
-        // );
-        // this.commandsDisposables.push(
-        //     commands.registerCommand("editor.action.indentationToSpaces", () =>
-        //         this.resetHighlight("editor.action.indentationToSpaces"),
-        //     ),
-        // );
-        // this.commandsDisposables.push(
-        //     commands.registerCommand("editor.action.reindentlines", () =>
-        //         this.resetHighlight("editor.action.reindentlines"),
-        //     ),
-        // );
-    }
-    public dispose(): void {
-        this.disposables.forEach((d) => d.dispose());
-        this.commandsDisposables.forEach((d) => d.dispose());
+    public constructor(private main: MainController) {
+        this.groupStore = new HighlightGroupStore();
+        this.disposables.push(
+            this.groupStore,
+            eventBus.on("redraw", this.handleRedraw, this),
+            eventBus.on("flush-redraw", this.handleRedrawFlush, this),
+        );
     }
 
-    public handleRedrawBatch(batch: [string, ...unknown[]][]): void {
-        const gridHLUpdates: Set<number> = new Set();
+    // Get or create a HighlightGrid for the given gridId
+    private getGrid(gridId: number): HighlightGrid {
+        if (!this.highlightGrids.has(gridId)) {
+            this.highlightGrids.set(
+                gridId,
+                new HighlightGrid(
+                    gridId,
+                    this.groupStore,
+                    this.main.bufferManager,
+                    this.main.viewportManager,
+                    this.main.changeManager,
+                ),
+            );
+        }
+        return this.highlightGrids.get(gridId)!;
+    }
 
-        for (const [name, ...args] of batch) {
+    private async handleRedraw({ name, args }: EventBusData<"redraw">): Promise<void> {
+        // Mark our `redraw` event as processing, so that `redraw-flush` will wait for all async
+        // execution to complete.
+        //
+        // We must do this before the await, so that we ensure that this is queued before
+        // this function returns (and a flush event could begin)
+        this.redrawWaitGroup.add();
+
+        await this.main.viewportManager.isSyncDone;
+
+        try {
             switch (name) {
                 case "hl_attr_define": {
-                    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-                    for (const [id, uiAttrs, , info] of args as [
-                        number,
-                        never,
-                        never,
-                        [{ kind: "ui"; ui_name: string; hi_name: string }],
-                    ][]) {
-                        // a cell can have multiple highlight groups when it overlap by another highlight
-                        if (info && info.length) {
-                            const groupName = info.reduce((acc, cur) => cur.hi_name + acc, "");
-                            this.highlightProvider.addHighlightGroup(id, groupName, uiAttrs);
-                        }
+                    for (const [id, uiAttrs, , info] of args) {
+                        this.handleAttrDefine(
+                            id,
+                            uiAttrs,
+                            info.map((i) => i.hi_name),
+                        );
                     }
                     break;
                 }
-                // nvim may not send grid_cursor_goto and instead uses grid_scroll along with grid_line
-                case "grid_scroll": {
-                    for (const [grid, top, , , , by] of args as [
-                        number,
-                        number,
-                        number,
-                        null,
-                        number,
-                        number,
-                        number,
-                    ][]) {
-                        if (grid === 1) {
-                            continue;
-                        }
-                        // by > 0 - scroll down, must remove existing elements from first and shift row hl left
-                        // by < 0 - scroll up, must remove existing elements from right shift row hl right
-                        this.highlightProvider.shiftGridHighlights(grid, by, top);
-                        gridHLUpdates.add(grid);
-                    }
-                    break;
-                }
+                // NOTES: We don't handle "grid_scroll" because:
+                // 1. We only need the cells data of the grid and do not need to consider scrolling.
+                // 2. The scrolled-in area will be filled using `grid_line` directly after the scroll event.
+                // Thus, we don't need to clear this area as part of handling the scroll event. (From the neovim-ui doc)
                 case "grid_line": {
-                    // [grid, row, colStart, cells: [text, hlId, repeat]]
-                    const gridEvents = args as GridLineEvent[];
-
-                    // eslint-disable-next-line prefer-const
-                    for (let [grid, row, col, cells] of gridEvents) {
-                        const gridOffset = this.main.viewportManager.getGridOffset(grid);
-                        if (!gridOffset) {
-                            continue;
-                        }
-
-                        const editor = this.main.bufferManager.getEditorFromGridId(grid);
-                        if (!editor) {
-                            continue;
-                        }
-
-                        // const topScreenLine = gridConf.cursorLine === 0 ? 0 : gridConf.cursorLine - gridConf.screenLine;
-                        const topScreenLine = gridOffset.topLine;
-                        const highlightLine = topScreenLine + row;
-                        if (highlightLine >= editor.document.lineCount || highlightLine < 0) {
-                            if (highlightLine > 0) {
-                                this.highlightProvider.cleanRow(grid, row);
-                                gridHLUpdates.add(grid);
-                            }
-                            continue;
-                        }
-                        const line = editor.document.lineAt(highlightLine).text;
-                        const colStart = col + gridOffset.leftCol;
-                        const tabSize = editor.options.tabSize as number;
-                        const finalStartCol = calculateEditorColFromVimScreenCol(line, colStart, tabSize);
-                        const isExternal = this.main.bufferManager.isExternalTextDocument(editor.document);
-                        const update = this.highlightProvider.processHLCellsEvent(
-                            grid,
-                            row,
-                            finalStartCol,
-                            line,
-                            isExternal,
-                            cells,
-                        );
-                        if (update) {
-                            gridHLUpdates.add(grid);
+                    for (const [grid, row, col, cells] of args) {
+                        if (grid !== 1) {
+                            this.handleGridLine(grid, row, col, cells);
                         }
                     }
                     break;
                 }
-            }
-        }
-        if (gridHLUpdates.size) {
-            this.applyHLGridUpdates(gridHLUpdates);
-        }
-    }
-
-    public async handleExtensionRequest(name: string, args: unknown[]): Promise<void> {
-        switch (name) {
-            case "text-decorations": {
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                const [hlName, cols] = args as any;
-                this.applyTextDecorations(hlName, cols);
-                break;
-            }
-        }
-    }
-
-    private applyHLGridUpdates = (updates: Set<number>): void => {
-        for (const grid of updates) {
-            const gridOffset = this.main.viewportManager.getGridOffset(grid);
-            const editor = this.main.bufferManager.getEditorFromGridId(grid);
-            if (!editor || !gridOffset) {
-                continue;
-            }
-            const hls = this.highlightProvider.getGridHighlights(grid, gridOffset.topLine);
-            for (const [decorator, ranges] of hls) {
-                editor.setDecorations(decorator, ranges);
-            }
-        }
-    };
-
-    /**
-     * Apply text decorations from external command. Currently used by easymotion fork
-     * @param hlGroupName VIM HL Group name
-     * @param decorations Text decorations, the format is [[lineNum, [colNum, text][]]]
-     */
-    private applyTextDecorations(hlGroupName: string, decorations: [string, [number, string][]][]): void {
-        const editor = window.activeTextEditor;
-        if (!editor) {
-            return;
-        }
-        const decorator = this.highlightProvider.getDecoratorForHighlightGroup(hlGroupName);
-        if (!decorator) {
-            return;
-        }
-        const conf = this.highlightProvider.getDecoratorOptions(decorator);
-        const options: DecorationOptions[] = [];
-        for (const [lineStr, cols] of decorations) {
-            try {
-                const lineNum = parseInt(lineStr, 10) - 1;
-                const line = editor.document.lineAt(lineNum).text;
-                const drawnAt = new Map();
-                for (const [colNum, text] of cols) {
-                    // vim sends column in bytes, need to convert to characters
-                    const col = convertByteNumToCharNum(line, colNum);
-                    const mapKey = [lineNum, Math.min(col + text.length - 1, line.length)].toString();
-                    if (drawnAt.has(mapKey)) {
-                        // VSCode only lets us draw a single text decoration
-                        // at any given character. Any text decorations drawn
-                        // past the end of the line get moved back to the end of
-                        // the line. This becomes a problem if you have a
-                        // line with multiple 2 character marks right
-                        // next to each other at the end. The solution is to
-                        // use a single text decoration but modify it when a
-                        // new decoration would be pushed on top of it.
-                        const ogText = drawnAt.get(mapKey).renderOptions.after.contentText;
-                        drawnAt.get(mapKey).renderOptions.after.contentText = (text[0] + ogText).substr(
-                            0,
-                            ogText.length,
-                        );
-                    } else {
-                        const opt = this.highlightProvider.createVirtTextDecorationOption(
-                            text,
-                            conf,
-                            lineNum,
-                            col,
-                            line.length,
-                        );
-                        drawnAt.set(mapKey, opt);
-                        options.push(opt);
-                    }
+                case "grid_destroy": {
+                    args.forEach(([grid]) => this.handleGridDestroy(grid));
                 }
-            } catch {
-                // ignore
             }
+        } finally {
+            // We don't want to hold a flush up forever if there's
+            // an exception, so we wrap this in a try/finally
+            this.redrawWaitGroup.done();
         }
-        editor.setDecorations(decorator, options);
     }
 
-    // TODO: Investigate why it doesn't work. You don't often to change indentation so seems minor
-    // private resetHighlight = async (cmd: string): Promise<void> => {
-    //     this.logger.debug(`${LOG_PREFIX}: Command wrapper: ${cmd}`);
-    //     this.commandsDisposables.forEach((d) => d.dispose());
-    //     await commands.executeCommand(cmd);
-    //     this.commandsDisposables.push(
-    //         commands.registerCommand("editor.action.indentationToTabs", () =>
-    //             this.resetHighlight("editor.action.indentationToTabs"),
-    //         ),
-    //     );
-    //     this.commandsDisposables.push(
-    //         commands.registerCommand("editor.action.indentationToSpaces", () =>
-    //             this.resetHighlight("editor.action.indentationToSpaces"),
-    //         ),
-    //     );
-    //     this.commandsDisposables.push(
-    //         commands.registerCommand("editor.action.reindentlines", () =>
-    //             this.resetHighlight("editor.action.reindentlines"),
-    //         ),
-    //     );
-    //     // Try clear highlights and force redraw
-    //     for (const editor of window.visibleTextEditors) {
-    //         const grid = this.bufferManager.getGridIdFromEditor(editor);
-    //         if (!grid) {
-    //             continue;
-    //         }
-    //         this.logger.debug(`${LOG_PREFIX}: Clearing HL ranges for grid: ${grid}`);
-    //         const reset = this.highlightProvider.clearHighlights(grid);
-    //         for (const [decorator, range] of reset) {
-    //             editor.setDecorations(decorator, range);
-    //         }
-    //     }
-    //     this.logger.debug(`${LOG_PREFIX}: Redrawing`);
-    //     this.client.command("redraw!");
-    // };
+    private async handleRedrawFlush() {
+        // Wait for any redraw events that have been received to finish
+        // their work, so that we can flush them only after their changes are staged.
+        await this.redrawWaitGroup.wait();
+        this.highlightGrids.forEach((grid) => grid.handleRedrawFlush());
+    }
+
+    private handleAttrDefine(id: number, attrs: VimHighlightUIAttributes, groups: string[]) {
+        this.groupStore.add(id, attrs, groups);
+    }
+
+    private handleGridLine(gridId: number, row: number, col: number, cells: VimCell[]): void {
+        const gridOffset = this.main.viewportManager.getGridOffset(gridId);
+        const drawLine = gridOffset.line + row;
+        // Offset for the statuscolumn
+        const startCol = col + gridOffset.character;
+        // No reason for startCol to equal STATUSCOLUMN_WIDTH
+        const vimCol = startCol < STATUSCOLUMN_WIDTH ? 0 : startCol - STATUSCOLUMN_WIDTH;
+        if (startCol < STATUSCOLUMN_WIDTH) {
+            // leading dashes could be combined with statuscolumn
+            const delta = STATUSCOLUMN_WIDTH - startCol;
+            if (cells[0][2]! > delta) cells[0][2]! -= delta;
+            else cells.shift();
+        }
+
+        this.getGrid(gridId).handleGridLine(drawLine, vimCol, cells);
+    }
+
+    private handleGridDestroy(gridId: number): void {
+        this.highlightGrids.get(gridId)?.dispose();
+        this.highlightGrids.delete(gridId);
+    }
+
+    dispose(): void {
+        disposeAll(this.disposables);
+    }
 }
